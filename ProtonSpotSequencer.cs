@@ -36,7 +36,7 @@ public class AssemblyExpirationDate : Attribute
 
 public static class SimpleLicenseVerifier
 {
-    private const string HARDCODED_ACCESS_CODE = "2b5d666c";
+    private const string HARDCODED_ACCESS_CODE = "2b5d777c";
     private const string APP_SETTINGS_SUBDIR = "MAAS-ProtonSpotSequencer-Settings";
 
     private static string GetAppSettingsDir()
@@ -1772,8 +1772,8 @@ namespace VMS.TPS
     {
         private const string PROJECT_NAME = "ProtonSpotSequencer";
         private const string PROJECT_VERSION = "1.0.0";
-        private const string LICENSE_URL = "https://varian-medicalaffairsappliedsolutions.github.io/MAAS-ProtonSnoutCollision";
-        private const string GITHUB_URL = "https://github.com/Varian-MedicalAffairsAppliedSolutions/MAAS-ProtonSnoutCollision";
+        private const string LICENSE_URL = "https://varian-medicalaffairsappliedsolutions.github.io/MAAS-ProtonSpotSequencer";
+        private const string GITHUB_URL = "https://github.com/Varian-MedicalAffairsAppliedSolutions/MAAS-ProtonSpotSequencer";
 
         private bool IsValidated = false;
 
