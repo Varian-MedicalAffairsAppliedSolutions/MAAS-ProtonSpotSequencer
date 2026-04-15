@@ -949,7 +949,7 @@ namespace VMS.TPS
             modifiedFieldsText = CreateReadOnlyBlock();
             TextBlock instructionText = CreateReadOnlyBlock();
             instructionText.TextWrapping = TextWrapping.Wrap;
-            instructionText.Text = "Left-click a red spot to append it to the green sequence. Use mouse wheel to zoom. Current save behavior intentionally matches the Python tool and writes the selected sequence to every energy layer in each modified field.";
+            instructionText.Text = "Left-click a red spot to append it to the green sequence. Use mouse wheel to zoom.";
             actionPanel.Children.Add(sequenceSummaryText);
             actionPanel.Children.Add(modifiedFieldsText);
             actionPanel.Children.Add(instructionText);
@@ -1463,7 +1463,7 @@ namespace VMS.TPS
             }
 
             string confirmation = string.Format(CultureInfo.InvariantCulture,
-                "Apply the pending sequenced spots to {0} field(s) and recalculate dose?\n\nThis preserves the current Python behavior and writes the same selected sequence to every energy layer in each modified field.",
+                "Apply the pending sequenced spots to {0} field(s) and recalculate dose?\n\nThis writes the same selected sequence to every energy layer in each modified field.",
                 modifiedFields.Count);
             if (MessageBox.Show(confirmation, "Confirm Apply", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
             {
@@ -1603,8 +1603,6 @@ namespace VMS.TPS
                 "Use the mouse wheel over the canvas to zoom.",
                 "Toggle structures in the left panel to show or hide outlines.",
                 "Apply To Plan writes pending sequences back into the active plan and recalculates dose.",
-                "Current save behavior matches the Python tool: the same selected sequence is written to every energy layer in each modified field.",
-                "Export has been intentionally removed so the tool operates fully in memory."
             });
 
             MessageBox.Show(info, "Proton Spot Sequencer Help", MessageBoxButton.OK, MessageBoxImage.Information);
