@@ -115,9 +115,16 @@ public static class SimpleLicenseVerifier
         mainPanel.Children.Add(title);
 
         TextBlock instructions = new TextBlock();
-        instructions.Text = "Please visit the following URL to obtain your access code:\n" + licenseUrl + "\n\nEnter the access code below to continue.";
         instructions.TextWrapping = TextWrapping.Wrap;
         instructions.Margin = new Thickness(0, 0, 0, 20);
+        instructions.Inlines.Add(new Run("Please visit the following URL to obtain your access code:\n"));
+
+        Hyperlink licenseLink = new Hyperlink(new Run(licenseUrl));
+        licenseLink.NavigateUri = new Uri(licenseUrl, UriKind.Absolute);
+        licenseLink.RequestNavigate += OnLicenseLinkRequestNavigate;
+        instructions.Inlines.Add(licenseLink);
+
+        instructions.Inlines.Add(new Run("\n\nEnter the access code below to continue."));
         mainPanel.Children.Add(instructions);
 
         TextBlock codeLabel = new TextBlock();
@@ -188,6 +195,12 @@ public static class SimpleLicenseVerifier
         licenseWindow.Loaded += (sender, e) => codeTextBox.Focus();
         licenseWindow.ShowDialog();
         return result;
+    }
+
+    private static void OnLicenseLinkRequestNavigate(object sender, RequestNavigateEventArgs e)
+    {
+        Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true });
+        e.Handled = true;
     }
 
     private static bool VerifyAccessCode(string inputCode)
@@ -391,13 +404,14 @@ namespace VMS.TPS
         {
             Focusable = true;
             ClipToBounds = true;
-            Cursor = Cursors.Cross;
+            Cursor = Cursors.Arrow;
             selectedStructureNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             MouseMove += OnCanvasMouseMove;
             MouseLeave += OnCanvasMouseLeave;
             MouseLeftButtonDown += OnCanvasMouseLeftButtonDown;
             MouseWheel += OnCanvasMouseWheel;
+            QueryCursor += OnCanvasQueryCursor;
             SizeChanged += (sender, e) => InvalidateVisual();
         }
 
@@ -456,6 +470,7 @@ namespace VMS.TPS
                 Point hoverPoint = WorldToScreen(hoveredSpot.X, hoveredSpot.Y, scale, offsetX, offsetY);
                 drawingContext.DrawEllipse(null, new Pen(Brushes.Yellow, 2.0), hoverPoint, 6.0, 6.0);
             }
+
         }
 
         private void DrawStructures(DrawingContext drawingContext, double scale, double offsetX, double offsetY)
@@ -640,6 +655,12 @@ namespace VMS.TPS
             Point worldPoint = ScreenToWorld(e.GetPosition(this));
             ZoomAround(worldPoint, e.Delta / 120.0);
             InvalidateVisual();
+            e.Handled = true;
+        }
+
+        private void OnCanvasQueryCursor(object sender, QueryCursorEventArgs e)
+        {
+            e.Cursor = Cursors.Arrow;
             e.Handled = true;
         }
 
@@ -1775,6 +1796,112 @@ namespace VMS.TPS
 
         private bool IsValidated = false;
 
+        private static MessageBoxResult ShowLinkedDialog(Window owner, string title, string textBeforeLink, string linkUrl, string textAfterLink, MessageBoxButton buttons)
+        {
+            Window dialog = new Window();
+            dialog.Title = title;
+            dialog.Width = 620;
+            dialog.Height = 260;
+            dialog.MinWidth = 620;
+            dialog.MinHeight = 260;
+            dialog.WindowStartupLocation = owner != null ? WindowStartupLocation.CenterOwner : WindowStartupLocation.CenterScreen;
+            dialog.ResizeMode = ResizeMode.NoResize;
+            dialog.Background = Brushes.White;
+            dialog.ShowInTaskbar = false;
+
+            if (owner != null)
+            {
+                dialog.Owner = owner;
+            }
+
+            Grid root = new Grid();
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1.0, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            TextBlock messageText = new TextBlock();
+            messageText.Margin = new Thickness(20, 20, 20, 12);
+            messageText.TextWrapping = TextWrapping.Wrap;
+            messageText.Inlines.Add(new Run(textBeforeLink ?? string.Empty));
+
+            if (!string.IsNullOrWhiteSpace(linkUrl))
+            {
+                Hyperlink hyperlink = new Hyperlink(new Run(linkUrl));
+                hyperlink.NavigateUri = new Uri(linkUrl, UriKind.Absolute);
+                hyperlink.RequestNavigate += OnAgreementLinkRequestNavigate;
+                messageText.Inlines.Add(hyperlink);
+            }
+
+            messageText.Inlines.Add(new Run(textAfterLink ?? string.Empty));
+            Grid.SetRow(messageText, 0);
+            root.Children.Add(messageText);
+
+            StackPanel buttonPanel = new StackPanel();
+            buttonPanel.Orientation = Orientation.Horizontal;
+            buttonPanel.HorizontalAlignment = HorizontalAlignment.Right;
+            buttonPanel.Margin = new Thickness(20, 0, 20, 20);
+
+            MessageBoxResult result = buttons == MessageBoxButton.YesNo ? MessageBoxResult.No : MessageBoxResult.OK;
+
+            if (buttons == MessageBoxButton.YesNo)
+            {
+                Button yesButton = new Button();
+                yesButton.Content = "Yes";
+                yesButton.Width = 90;
+                yesButton.Height = 28;
+                yesButton.Margin = new Thickness(0, 0, 10, 0);
+                yesButton.IsDefault = true;
+                yesButton.Click += (sender, e) =>
+                {
+                    result = MessageBoxResult.Yes;
+                    dialog.DialogResult = true;
+                    dialog.Close();
+                };
+                buttonPanel.Children.Add(yesButton);
+
+                Button noButton = new Button();
+                noButton.Content = "No";
+                noButton.Width = 90;
+                noButton.Height = 28;
+                noButton.IsCancel = true;
+                noButton.Click += (sender, e) =>
+                {
+                    result = MessageBoxResult.No;
+                    dialog.DialogResult = false;
+                    dialog.Close();
+                };
+                buttonPanel.Children.Add(noButton);
+            }
+            else
+            {
+                Button okButton = new Button();
+                okButton.Content = "OK";
+                okButton.Width = 90;
+                okButton.Height = 28;
+                okButton.IsDefault = true;
+                okButton.IsCancel = true;
+                okButton.Click += (sender, e) =>
+                {
+                    result = MessageBoxResult.OK;
+                    dialog.DialogResult = true;
+                    dialog.Close();
+                };
+                buttonPanel.Children.Add(okButton);
+            }
+
+            Grid.SetRow(buttonPanel, 1);
+            root.Children.Add(buttonPanel);
+
+            dialog.Content = root;
+            dialog.ShowDialog();
+            return result;
+        }
+
+        private static void OnAgreementLinkRequestNavigate(object sender, RequestNavigateEventArgs e)
+        {
+            Process.Start(new ProcessStartInfo(e.Uri.AbsoluteUri) { UseShellExecute = true });
+            e.Handled = true;
+        }
+
         [MethodImpl(MethodImplOptions.NoInlining)]
         public void Execute(ScriptContext context, Window window, ScriptEnvironment environment)
         {
@@ -1800,12 +1927,19 @@ namespace VMS.TPS
                 {
                     if (DateTime.Now > endDate && !noExpire)
                     {
-                        MessageBox.Show("Application has expired. Newer builds with future expiration dates can be found here: " + GITHUB_URL);
+                        ShowLinkedDialog(
+                            window,
+                            "Application Expired",
+                            "Application has expired. Newer builds with future expiration dates can be found here: ",
+                            GITHUB_URL,
+                            string.Empty,
+                            MessageBoxButton.OK);
                         return;
                     }
 
-                    string firstUseMessage = "The current " + PROJECT_NAME + " application is provided AS IS as a non-clinical, research only tool in evaluation only. The current application will only be available until " + endDate.ToShortDateString() + " after which the application will be unavailable. By clicking 'Yes' you agree that this application will be evaluated and not utilized in providing planning decision support.\n\nNewer builds with future expiration dates can be found here: " + GITHUB_URL + "\n\nSee the FAQ for more information on how to remove this pop-up and expiration.";
-                    string repeatUseMessage = "Application will only be available until " + endDate.ToShortDateString() + " after which the application will be unavailable. By clicking 'Yes' you agree that this application will be evaluated and not utilized in providing planning decision support.\n\nNewer builds with future expiration dates can be found here: " + GITHUB_URL + "\n\nSee the FAQ for more information on how to remove this pop-up and expiration.";
+                    string agreementMessageSuffix = "\n\nSee the FAQ for more information on how to remove this pop-up and expiration.";
+                    string firstUseMessagePrefix = "The current " + PROJECT_NAME + " application is provided AS IS as a non-clinical, research only tool in evaluation only. The current application will only be available until " + endDate.ToShortDateString() + " after which the application will be unavailable. By clicking 'Yes' you agree that this application will be evaluated and not utilized in providing planning decision support.\n\nNewer builds with future expiration dates can be found here: ";
+                    string repeatUseMessagePrefix = "Application will only be available until " + endDate.ToShortDateString() + " after which the application will be unavailable. By clicking 'Yes' you agree that this application will be evaluated and not utilized in providing planning decision support.\n\nNewer builds with future expiration dates can be found here: ";
 
                     bool isValidatedForUser = IsValidated;
                     string validatedFilePath = SimpleLicenseVerifier.GetValidatedFilePath(PROJECT_NAME);
@@ -1815,7 +1949,7 @@ namespace VMS.TPS
                     {
                         if (!hasValidatedBefore)
                         {
-                            if (MessageBox.Show(firstUseMessage, "Agreement", MessageBoxButton.YesNo) == MessageBoxResult.No)
+                            if (ShowLinkedDialog(window, "Agreement", firstUseMessagePrefix, GITHUB_URL, agreementMessageSuffix, MessageBoxButton.YesNo) == MessageBoxResult.No)
                             {
                                 return;
                             }
@@ -1833,7 +1967,7 @@ namespace VMS.TPS
                         }
                         else
                         {
-                            if (MessageBox.Show(repeatUseMessage, "Agreement", MessageBoxButton.YesNo) == MessageBoxResult.No)
+                            if (ShowLinkedDialog(window, "Agreement", repeatUseMessagePrefix, GITHUB_URL, agreementMessageSuffix, MessageBoxButton.YesNo) == MessageBoxResult.No)
                             {
                                 return;
                             }
