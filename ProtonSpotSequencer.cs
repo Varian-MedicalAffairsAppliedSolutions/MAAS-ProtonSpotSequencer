@@ -252,6 +252,67 @@ namespace VMS.TPS
         public Color Color { get; private set; }
 
         public List<List<Point>> Contours { get; private set; }
+
+        /// <summary>
+        /// Returns true if (x, y) is inside any contour of this structure.
+        /// Uses the ray-casting algorithm.
+        /// </summary>
+        public bool ContainsPoint(double x, double y)
+        {
+            foreach (List<Point> contour in Contours)
+            {
+                if (contour.Count < 3) continue;
+                bool inside = false;
+                int j = contour.Count - 1;
+                for (int i = 0; i < contour.Count; i++)
+                {
+                    double xi = contour[i].X, yi = contour[i].Y;
+                    double xj = contour[j].X, yj = contour[j].Y;
+                    if (((yi > y) != (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi))
+                        inside = !inside;
+                    j = i;
+                }
+                if (inside) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Returns true if (x, y) is within <paramref name="margin"/> mm of any contour edge.
+        /// Used to expand the ROI boundary to include surrounding spots.
+        /// </summary>
+        public bool IsWithinMargin(double x, double y, double margin)
+        {
+            if (margin <= 0) return false;
+            double marginSq = margin * margin;
+            foreach (List<Point> contour in Contours)
+            {
+                for (int i = 0; i < contour.Count; i++)
+                {
+                    int j = (i + 1) % contour.Count;
+                    if (PointToSegmentDistanceSq(x, y, contour[i].X, contour[i].Y,
+                                                        contour[j].X, contour[j].Y) <= marginSq)
+                        return true;
+                }
+            }
+            return false;
+        }
+
+        private static double PointToSegmentDistanceSq(double px, double py,
+            double ax, double ay, double bx, double by)
+        {
+            double dx = bx - ax, dy = by - ay;
+            double lenSq = dx * dx + dy * dy;
+            if (lenSq < 1e-10) // degenerate segment
+            {
+                double ex = px - ax, ey = py - ay;
+                return ex * ex + ey * ey;
+            }
+            double t = Math.Max(0, Math.Min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
+            double qx = ax + t * dx - px;
+            double qy = ay + t * dy - py;
+            return qx * qx + qy * qy;
+        }
     }
 
     internal sealed class FieldState
@@ -830,6 +891,20 @@ namespace VMS.TPS
 
         private FieldState activeField;
 
+        // Auto-sequence controls
+        private TextBox sectionsTextBox;
+        private Button autoSequenceButton;
+        private TextBox maxJumpXBox;
+        private TextBox maxJumpYBox;
+        private StackPanel roiCheckPanel;
+        private readonly HashSet<string> selectedRoiNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Pinned start spot for auto-sequence
+        private SpotInfo pinnedStartSpot;
+        private bool pickingStartSpot;
+        private Button pickStartButton;
+        private TextBlock startSpotLabel;
+
         public ProtonSpotSequencer(ScriptContext context, Window window, ScriptEnvironment environment, bool isValidated)
         {
             if (context.Patient == null)
@@ -974,6 +1049,139 @@ namespace VMS.TPS
             actionPanel.Children.Add(sequenceSummaryText);
             actionPanel.Children.Add(modifiedFieldsText);
             actionPanel.Children.Add(instructionText);
+
+            // Auto-sequence row: label + sections input + button
+            WrapPanel autoSequencePanel = new WrapPanel();
+            autoSequencePanel.Margin = new Thickness(0, 6, 0, 0);
+            autoSequencePanel.VerticalAlignment = VerticalAlignment.Center;
+            actionPanel.Children.Add(autoSequencePanel);
+
+            TextBlock sectionsLabel = new TextBlock();
+            sectionsLabel.Text = "Sections:";
+            sectionsLabel.FontWeight = FontWeights.Bold;
+            sectionsLabel.VerticalAlignment = VerticalAlignment.Center;
+            sectionsLabel.Margin = new Thickness(0, 0, 6, 0);
+            autoSequencePanel.Children.Add(sectionsLabel);
+
+            sectionsTextBox = new TextBox();
+            sectionsTextBox.Text = "1";
+            sectionsTextBox.Width = 40;
+            sectionsTextBox.Height = 24;
+            sectionsTextBox.VerticalContentAlignment = VerticalAlignment.Center;
+            sectionsTextBox.Margin = new Thickness(0, 0, 8, 0);
+            autoSequencePanel.Children.Add(sectionsTextBox);
+
+            autoSequenceButton = new Button();
+            autoSequenceButton.Content = "Auto-Sequence (S-pattern)";
+            autoSequenceButton.Padding = new Thickness(10, 4, 10, 4);
+            autoSequenceButton.Click += (sender, e) => RunSPatternAutoSequence();
+            autoSequencePanel.Children.Add(autoSequenceButton);
+
+            // Start spot row
+            WrapPanel startSpotPanel = new WrapPanel();
+            startSpotPanel.Margin = new Thickness(0, 4, 0, 0);
+            startSpotPanel.VerticalAlignment = VerticalAlignment.Center;
+            actionPanel.Children.Add(startSpotPanel);
+
+            TextBlock startSpotTitle = new TextBlock();
+            startSpotTitle.Text = "Start spot:";
+            startSpotTitle.FontWeight = FontWeights.Bold;
+            startSpotTitle.VerticalAlignment = VerticalAlignment.Center;
+            startSpotTitle.Margin = new Thickness(0, 0, 6, 0);
+            startSpotPanel.Children.Add(startSpotTitle);
+
+            pickStartButton = new Button();
+            pickStartButton.Content = "Pick on canvas";
+            pickStartButton.Padding = new Thickness(10, 4, 10, 4);
+            pickStartButton.Margin = new Thickness(0, 0, 6, 0);
+            pickStartButton.Click += (sender, e) => TogglePickStartSpot();
+            startSpotPanel.Children.Add(pickStartButton);
+
+            Button clearStartButton = new Button();
+            clearStartButton.Content = "Clear";
+            clearStartButton.Padding = new Thickness(10, 4, 10, 4);
+            clearStartButton.Margin = new Thickness(0, 0, 8, 0);
+            clearStartButton.Click += (sender, e) => ClearStartSpot();
+            startSpotPanel.Children.Add(clearStartButton);
+
+            startSpotLabel = new TextBlock();
+            startSpotLabel.Text = "None";
+            startSpotLabel.VerticalAlignment = VerticalAlignment.Center;
+            startSpotLabel.Foreground = System.Windows.Media.Brushes.Gray;
+            startSpotPanel.Children.Add(startSpotLabel);
+
+            // Priority ROI section: compact scrollable checkbox list
+            StackPanel roiSectionPanel = new StackPanel();
+            roiSectionPanel.Margin = new Thickness(0, 6, 0, 0);
+            actionPanel.Children.Add(roiSectionPanel);
+
+            TextBlock roiLabel = new TextBlock();
+            roiLabel.Text = "Priority ROI sections (sequenced first, in order):";
+            roiLabel.FontWeight = FontWeights.Bold;
+            roiLabel.Margin = new Thickness(0, 0, 0, 4);
+            roiSectionPanel.Children.Add(roiLabel);
+
+            Border roiBorder = new Border();
+            roiBorder.BorderBrush = Brushes.Brown;
+            roiBorder.BorderThickness = new Thickness(1);
+            roiBorder.CornerRadius = new CornerRadius(2);
+            roiBorder.Background = Brushes.White;
+            roiBorder.MaxHeight = 70;
+            roiSectionPanel.Children.Add(roiBorder);
+
+            ScrollViewer roiScroll = new ScrollViewer();
+            roiScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+            roiBorder.Child = roiScroll;
+
+            roiCheckPanel = new StackPanel();
+            roiCheckPanel.Margin = new Thickness(4, 2, 4, 2);
+            roiScroll.Content = roiCheckPanel;
+
+            // Max jump row: limits the maximum X and Y step between consecutive spots
+            WrapPanel maxJumpPanel = new WrapPanel();
+            maxJumpPanel.Margin = new Thickness(0, 4, 0, 0);
+            maxJumpPanel.VerticalAlignment = VerticalAlignment.Center;
+            actionPanel.Children.Add(maxJumpPanel);
+
+            TextBlock maxJumpLabel = new TextBlock();
+            maxJumpLabel.Text = "Max jump:";
+            maxJumpLabel.FontWeight = FontWeights.Bold;
+            maxJumpLabel.VerticalAlignment = VerticalAlignment.Center;
+            maxJumpLabel.Margin = new Thickness(0, 0, 6, 0);
+            maxJumpPanel.Children.Add(maxJumpLabel);
+
+            TextBlock xLabel = new TextBlock();
+            xLabel.Text = "X:";
+            xLabel.VerticalAlignment = VerticalAlignment.Center;
+            xLabel.Margin = new Thickness(0, 0, 4, 0);
+            maxJumpPanel.Children.Add(xLabel);
+
+            maxJumpXBox = new TextBox();
+            maxJumpXBox.Text = "0";
+            maxJumpXBox.Width = 45;
+            maxJumpXBox.Height = 24;
+            maxJumpXBox.VerticalContentAlignment = VerticalAlignment.Center;
+            maxJumpXBox.Margin = new Thickness(0, 0, 8, 0);
+            maxJumpPanel.Children.Add(maxJumpXBox);
+
+            TextBlock yLabel = new TextBlock();
+            yLabel.Text = "Y:";
+            yLabel.VerticalAlignment = VerticalAlignment.Center;
+            yLabel.Margin = new Thickness(0, 0, 4, 0);
+            maxJumpPanel.Children.Add(yLabel);
+
+            maxJumpYBox = new TextBox();
+            maxJumpYBox.Text = "0";
+            maxJumpYBox.Width = 45;
+            maxJumpYBox.Height = 24;
+            maxJumpYBox.VerticalContentAlignment = VerticalAlignment.Center;
+            maxJumpYBox.Margin = new Thickness(0, 0, 8, 0);
+            maxJumpPanel.Children.Add(maxJumpYBox);
+
+            TextBlock mmLabel = new TextBlock();
+            mmLabel.Text = "mm  (0 = no limit)";
+            mmLabel.VerticalAlignment = VerticalAlignment.Center;
+            maxJumpPanel.Children.Add(mmLabel);
 
             Grid bodyGrid = new Grid();
             bodyGrid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(240.0) });
@@ -1291,6 +1499,20 @@ namespace VMS.TPS
 
             suppressStructureEvents = false;
             bevCanvas.InvalidateVisual();
+
+            // Populate ROI checkbox panel — vertical list, preserve previous selections
+            roiCheckPanel.Children.Clear();
+            foreach (string name in orderedNames)
+            {
+                bool wasChecked = selectedRoiNames.Contains(name);
+                CheckBox cb = new CheckBox();
+                cb.Content = name;
+                cb.IsChecked = wasChecked;
+                cb.Margin = new Thickness(0, 1, 0, 1);
+                cb.Checked   += (s, e) => { selectedRoiNames.Add(((CheckBox)s).Content.ToString()); };
+                cb.Unchecked += (s, e) => { selectedRoiNames.Remove(((CheckBox)s).Content.ToString()); };
+                roiCheckPanel.Children.Add(cb);
+            }
         }
 
         private void OnFieldSelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -1357,13 +1579,46 @@ namespace VMS.TPS
             bevCanvas.InvalidateVisual();
         }
 
+        private void TogglePickStartSpot()
+        {
+            pickingStartSpot = !pickingStartSpot;
+            pickStartButton.Content = pickingStartSpot ? "Click a spot..." : "Pick on canvas";
+            pickStartButton.Background = pickingStartSpot ? System.Windows.Media.Brushes.LightYellow : null;
+            SetStatus(pickingStartSpot ? "Click a red spot on the canvas to set it as the auto-sequence start spot." : "Ready");
+        }
+
+        private void ClearStartSpot()
+        {
+            pinnedStartSpot = null;
+            pickingStartSpot = false;
+            pickStartButton.Content = "Pick on canvas";
+            pickStartButton.Background = null;
+            startSpotLabel.Text = "None";
+            startSpotLabel.Foreground = System.Windows.Media.Brushes.Gray;
+            SetStatus("Start spot cleared.");
+        }
+
         private void AddSpotToSequence(SpotInfo spot)
         {
-            if (activeField == null || spot == null)
+            if (activeField == null || spot == null) return;
+
+            // If in picking mode, capture this spot as the pinned start spot
+            if (pickingStartSpot)
             {
+                pinnedStartSpot = spot.Copy();
+                pickingStartSpot = false;
+                pickStartButton.Content = "Pick on canvas";
+                pickStartButton.Background = null;
+                startSpotLabel.Text = string.Format(CultureInfo.InvariantCulture,
+                    "X={0:0.00}, Y={1:0.00}", pinnedStartSpot.X, pinnedStartSpot.Y);
+                startSpotLabel.Foreground = System.Windows.Media.Brushes.DarkGreen;
+                SetStatus(string.Format(CultureInfo.InvariantCulture,
+                    "Start spot set to X={0:0.00}, Y={1:0.00}. Click Auto-Sequence to use it.",
+                    pinnedStartSpot.X, pinnedStartSpot.Y));
                 return;
             }
 
+            // Normal manual sequencing
             activeField.SequencedSpots.Add(spot.Copy());
             RefreshSequenceList();
             UpdateSummaries();
@@ -1472,6 +1727,235 @@ namespace VMS.TPS
             removeLastButton.IsEnabled = activeField.SequencedSpots.Count > 0;
             clearActiveButton.IsEnabled = activeField.SequencedSpots.Count > 0;
             clearAllButton.IsEnabled = hasAnyPendingSequence;
+        }
+
+        private void RunSPatternAutoSequence()
+        {
+            if (activeField == null || activeField.OriginalSpots.Count == 0)
+            {
+                SetStatus("No spots to sequence.");
+                return;
+            }
+
+            int totalSections;
+            if (!int.TryParse(sectionsTextBox.Text.Trim(), out totalSections) || totalSections < 1)
+            {
+                SetStatus("Invalid number of sections. Please enter a positive integer.");
+                return;
+            }
+
+            double maxJumpX = ParsePositiveDouble(maxJumpXBox.Text);
+            double maxJumpY = ParsePositiveDouble(maxJumpYBox.Text);
+            bool hasLimits = maxJumpX > 0 || maxJumpY > 0;
+
+            // Build ordered list of selected ROI structures
+            List<StructureOutlineInfo> priorityRois = activeField.Structures
+                .Where(s => selectedRoiNames.Contains(s.Name))
+                .ToList();
+
+            // Auto-detect margin as the median nearest-neighbour distance among all spots.
+            // This captures exactly the ring of spots one spacing away from the ROI boundary.
+            double roiMargin = DetectSpotSpacing(activeField.OriginalSpots);
+
+            // Assign spots to ROI groups (each spot goes to the first ROI that contains it,
+            // expanded by one spot spacing to include the surrounding ring of spots)
+            List<SpotInfo> spotPool = new List<SpotInfo>(activeField.OriginalSpots);
+            var roiGroups = new List<KeyValuePair<string, List<SpotInfo>>>();
+
+            foreach (StructureOutlineInfo roi in priorityRois)
+            {
+                List<SpotInfo> roiSpots = spotPool
+                    .Where(s => roi.ContainsPoint(s.X, s.Y) || roi.IsWithinMargin(s.X, s.Y, roiMargin))
+                    .ToList();
+                var roiSet = new HashSet<SpotInfo>(roiSpots);
+                spotPool = spotPool.Where(s => !roiSet.Contains(s)).ToList();
+                if (roiSpots.Count > 0)
+                    roiGroups.Add(new KeyValuePair<string, List<SpotInfo>>(roi.Name, roiSpots));
+            }
+
+            List<SpotInfo> restSpots = spotPool;
+
+            activeField.SequencedSpots.Clear();
+            int totalViolations = 0;
+            bool firstGroup = true;
+
+            // Sequence each priority ROI group in order
+            foreach (var roiGroup in roiGroups)
+            {
+                totalViolations += SequenceGroup(roiGroup.Value, totalSections, maxJumpX, maxJumpY, hasLimits, firstGroup);
+                firstGroup = false;
+            }
+
+            // Sequence the rest of the field
+            totalViolations += SequenceGroup(restSpots, totalSections, maxJumpX, maxJumpY, hasLimits, firstGroup);
+
+            RefreshSequenceList();
+            UpdateSummaries();
+            bevCanvas.InvalidateVisual();
+
+            string roiMsg = roiGroups.Count > 0
+                ? string.Format(CultureInfo.InvariantCulture, " ({0} priority ROI(s) first: {1})",
+                    roiGroups.Count,
+                    string.Join(", ", roiGroups.Select(g => string.Format("'{0}'({1})", g.Key, g.Value.Count)).ToArray()))
+                : "";
+
+            if (hasLimits && totalViolations > 0)
+                SetStatus(string.Format(CultureInfo.InvariantCulture,
+                    "Auto-sequence complete: {0} spot(s){1}. WARNING: {2} unavoidable violation(s).",
+                    activeField.SequencedSpots.Count, roiMsg, totalViolations));
+            else
+                SetStatus(string.Format(CultureInfo.InvariantCulture,
+                    "Auto-sequence complete: {0} spot(s){1}{2}.",
+                    activeField.SequencedSpots.Count, roiMsg,
+                    hasLimits ? " — all jumps within limits" : ""));
+        }
+
+        /// <summary>
+        /// Runs the grid + S-pattern + mirror-on-violation sequencing on a subset of spots
+        /// and appends the result to activeField.SequencedSpots.
+        /// Returns the number of unavoidable jump violations within this group.
+        /// </summary>
+        private int SequenceGroup(List<SpotInfo> spots, int totalSections,
+            double maxJumpX, double maxJumpY, bool hasLimits, bool applyStartSpot)
+        {
+            if (spots.Count == 0) return 0;
+
+            int cols = (int)Math.Floor(Math.Sqrt(totalSections));
+            if (cols < 1) cols = 1;
+            int rows = (int)Math.Ceiling((double)totalSections / cols);
+
+            double minX = spots.Min(s => s.X);
+            double maxX = spots.Max(s => s.X);
+            double minY = spots.Min(s => s.Y);
+            double maxY = spots.Max(s => s.Y);
+
+            double colWidth  = (maxX - minX + 0.001) / cols;
+            double rowHeight = (maxY - minY + 0.001) / rows;
+
+            // Assign each spot to a cell key and build a reverse lookup
+            var spotCell = new Dictionary<SpotInfo, int>(spots.Count);
+            var cells    = new Dictionary<int, HashSet<SpotInfo>>();
+            foreach (SpotInfo spot in spots)
+            {
+                int c   = Math.Min((int)((spot.X - minX) / colWidth),  cols - 1);
+                int r   = Math.Min((int)((spot.Y - minY) / rowHeight), rows - 1);
+                int key = c * rows + r;
+                spotCell[spot] = key;
+                if (!cells.ContainsKey(key)) cells[key] = new HashSet<SpotInfo>();
+                cells[key].Add(spot);
+            }
+
+            var remaining = new HashSet<SpotInfo>(spots);
+            int violations = 0;
+
+            SpotInfo currentPos = activeField.SequencedSpots.Count > 0
+                ? activeField.SequencedSpots[activeField.SequencedSpots.Count - 1]
+                : null;
+
+            // Handle pinned start spot
+            if (applyStartSpot && pinnedStartSpot != null && remaining.Count > 0)
+            {
+                SpotInfo pinned = remaining.OrderBy(s => Dist(pinnedStartSpot, s)).First();
+                remaining.Remove(pinned);
+                activeField.SequencedSpots.Add(pinned.Copy());
+                currentPos = pinned;
+            }
+
+            // Core loop: prefer nearest spot in the SAME cell (zero intra-cell jumps).
+            // Only cross to another cell when the current cell is exhausted.
+            // The cross-cell jump is always the shortest possible (globally nearest).
+            while (remaining.Count > 0)
+            {
+                int currentCell = (currentPos != null && spotCell.ContainsKey(currentPos))
+                    ? spotCell[currentPos] : -1;
+
+                SpotInfo next     = null;
+                double   nextDist = double.MaxValue;
+                bool     isCrossCell = false;
+
+                // 1. Nearest spot in same cell
+                if (currentCell >= 0 && cells.ContainsKey(currentCell))
+                {
+                    foreach (SpotInfo s in cells[currentCell])
+                    {
+                        if (!remaining.Contains(s)) continue;
+                        double d = currentPos != null ? Dist(currentPos, s) : 0;
+                        if (d < nextDist) { nextDist = d; next = s; }
+                    }
+                }
+
+                // 2. Current cell empty — find nearest spot globally
+                if (next == null)
+                {
+                    foreach (SpotInfo s in remaining)
+                    {
+                        double d = currentPos != null ? Dist(currentPos, s) : 0;
+                        if (d < nextDist) { nextDist = d; next = s; }
+                    }
+                    isCrossCell = true;
+                }
+
+                if (hasLimits && isCrossCell && currentPos != null && next != null)
+                {
+                    if (!IsWithinJump(currentPos, next, maxJumpX, maxJumpY))
+                        violations++;
+                }
+
+                remaining.Remove(next);
+                activeField.SequencedSpots.Add(next.Copy());
+                currentPos = next;
+            }
+
+            return violations;
+        }
+
+        private static double Dist(SpotInfo a, SpotInfo b)
+        {
+            double dx = a.X - b.X, dy = a.Y - b.Y;
+            return Math.Sqrt(dx * dx + dy * dy);
+        }
+
+        /// <summary>
+        /// Estimates the typical spot spacing as the median nearest-neighbour distance
+        /// among all spots. Used as the automatic ROI margin.
+        /// </summary>
+        private static double DetectSpotSpacing(IList<SpotInfo> spots)
+        {
+            if (spots == null || spots.Count < 2) return 5.0;
+
+            // For performance, sample at most 50 spots
+            int step = Math.Max(1, spots.Count / 50);
+            var distances = new List<double>();
+
+            for (int i = 0; i < spots.Count; i += step)
+            {
+                double minDist = double.MaxValue;
+                for (int j = 0; j < spots.Count; j++)
+                {
+                    if (i == j) continue;
+                    double d = Dist(spots[i], spots[j]);
+                    if (d < minDist) minDist = d;
+                }
+                if (minDist < double.MaxValue)
+                    distances.Add(minDist);
+            }
+
+            if (distances.Count == 0) return 5.0;
+            distances.Sort();
+            return distances[distances.Count / 2];
+        }
+
+        private static bool IsWithinJump(SpotInfo from, SpotInfo to, double maxJumpX, double maxJumpY)
+        {
+            if (maxJumpX > 0 && Math.Abs(to.X - from.X) > maxJumpX) return false;
+            if (maxJumpY > 0 && Math.Abs(to.Y - from.Y) > maxJumpY) return false;
+            return true;
+        }
+
+        private static double ParsePositiveDouble(string text)
+        {
+            double v;
+            return double.TryParse(text.Trim(), NumberStyles.Any, CultureInfo.InvariantCulture, out v) && v > 0 ? v : 0;
         }
 
         private void ApplyChangesToPlan()
