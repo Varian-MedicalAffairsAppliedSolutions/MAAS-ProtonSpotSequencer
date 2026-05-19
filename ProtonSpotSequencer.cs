@@ -1748,61 +1748,65 @@ namespace VMS.TPS
             double maxJumpY = ParsePositiveDouble(maxJumpYBox.Text);
             bool hasLimits = maxJumpX > 0 || maxJumpY > 0;
 
-            // Build ordered list of selected ROI structures
+            List<SpotInfo> allSpots = activeField.OriginalSpots;
+            double roiMargin = DetectSpotSpacing(allSpots);
+
+            // Build pre-assigned cluster map:
+            //   Cluster 0..R-1  = ROI clusters (visited first, in user order)
+            //   Cluster R..R+N-1 = rest-field clusters (k-means assigns these)
+            // spotClusterOverride[spot] = cluster index, or -1 for k-means assignment
+            var spotClusterOverride = new Dictionary<SpotInfo, int>(allSpots.Count);
+            var roiSpotSets = new List<HashSet<SpotInfo>>();
+            var roiNames    = new List<string>();
+
+            List<SpotInfo> spotPool = new List<SpotInfo>(allSpots);
             List<StructureOutlineInfo> priorityRois = activeField.Structures
                 .Where(s => selectedRoiNames.Contains(s.Name))
                 .ToList();
 
-            // Auto-detect margin as the median nearest-neighbour distance among all spots.
-            // This captures exactly the ring of spots one spacing away from the ROI boundary.
-            double roiMargin = DetectSpotSpacing(activeField.OriginalSpots);
-
-            // Assign spots to ROI groups (each spot goes to the first ROI that contains it,
-            // expanded by one spot spacing to include the surrounding ring of spots)
-            List<SpotInfo> spotPool = new List<SpotInfo>(activeField.OriginalSpots);
-            var roiGroups = new List<KeyValuePair<string, List<SpotInfo>>>();
-
+            int clusterIdx = 0;
             foreach (StructureOutlineInfo roi in priorityRois)
             {
                 List<SpotInfo> roiSpots = spotPool
                     .Where(s => roi.ContainsPoint(s.X, s.Y) || roi.IsWithinMargin(s.X, s.Y, roiMargin))
                     .ToList();
+                if (roiSpots.Count == 0) continue;
+
                 var roiSet = new HashSet<SpotInfo>(roiSpots);
+                roiSpotSets.Add(roiSet);
+                roiNames.Add(roi.Name);
+                foreach (SpotInfo s in roiSpots)
+                    spotClusterOverride[s] = clusterIdx;
                 spotPool = spotPool.Where(s => !roiSet.Contains(s)).ToList();
-                if (roiSpots.Count > 0)
-                    roiGroups.Add(new KeyValuePair<string, List<SpotInfo>>(roi.Name, roiSpots));
+                clusterIdx++;
             }
 
-            List<SpotInfo> restSpots = spotPool;
+            int nRoiClusters  = clusterIdx;
+            int nRestClusters = Math.Max(1, totalSections);
+            int nTotalClusters = nRoiClusters + nRestClusters;
 
             activeField.SequencedSpots.Clear();
-            int totalViolations = 0;
-            bool firstGroup = true;
 
-            // Sequence each priority ROI group in order
-            foreach (var roiGroup in roiGroups)
-            {
-                totalViolations += SequenceGroup(roiGroup.Value, totalSections, maxJumpX, maxJumpY, hasLimits, firstGroup);
-                firstGroup = false;
-            }
-
-            // Sequence the rest of the field
-            totalViolations += SequenceGroup(restSpots, totalSections, maxJumpX, maxJumpY, hasLimits, firstGroup);
+            int violations = SequenceGroup(
+                allSpots, spotPool, spotClusterOverride,
+                nRoiClusters, nRestClusters,
+                maxJumpX, maxJumpY, hasLimits);
 
             RefreshSequenceList();
             UpdateSummaries();
             bevCanvas.InvalidateVisual();
 
-            string roiMsg = roiGroups.Count > 0
-                ? string.Format(CultureInfo.InvariantCulture, " ({0} priority ROI(s) first: {1})",
-                    roiGroups.Count,
-                    string.Join(", ", roiGroups.Select(g => string.Format("'{0}'({1})", g.Key, g.Value.Count)).ToArray()))
+            string roiMsg = nRoiClusters > 0
+                ? string.Format(CultureInfo.InvariantCulture,
+                    " (ROI clusters first: {0})",
+                    string.Join(", ", roiNames.Select((n, i) =>
+                        string.Format("'{0}'({1})", n, roiSpotSets[i].Count)).ToArray()))
                 : "";
 
-            if (hasLimits && totalViolations > 0)
+            if (hasLimits && violations > 0)
                 SetStatus(string.Format(CultureInfo.InvariantCulture,
                     "Auto-sequence complete: {0} spot(s){1}. WARNING: {2} unavoidable violation(s).",
-                    activeField.SequencedSpots.Count, roiMsg, totalViolations));
+                    activeField.SequencedSpots.Count, roiMsg, violations));
             else
                 SetStatus(string.Format(CultureInfo.InvariantCulture,
                     "Auto-sequence complete: {0} spot(s){1}{2}.",
@@ -1811,103 +1815,187 @@ namespace VMS.TPS
         }
 
         /// <summary>
-        /// Runs the grid + S-pattern + mirror-on-violation sequencing on a subset of spots
-        /// and appends the result to activeField.SequencedSpots.
-        /// Returns the number of unavoidable jump violations within this group.
+        /// Clustered TSP sequencing that treats ROI clusters and rest-field clusters
+        /// as a unified set. ROI clusters are always visited first (in user order),
+        /// then rest-field clusters are ordered by greedy nearest-centroid TSP.
+        ///
+        /// Within every cluster: enter from nearest spot, then nearest-neighbour.
         /// </summary>
-        private int SequenceGroup(List<SpotInfo> spots, int totalSections,
-            double maxJumpX, double maxJumpY, bool hasLimits, bool applyStartSpot)
+        private int SequenceGroup(
+            List<SpotInfo> allSpots,
+            List<SpotInfo> restSpots,
+            Dictionary<SpotInfo, int> spotClusterOverride,
+            int nRoiClusters,
+            int nRestClusters,
+            double maxJumpX, double maxJumpY, bool hasLimits)
         {
-            if (spots.Count == 0) return 0;
+            int nTotal = nRoiClusters + nRestClusters;
 
-            int cols = (int)Math.Floor(Math.Sqrt(totalSections));
-            if (cols < 1) cols = 1;
-            int rows = (int)Math.Ceiling((double)totalSections / cols);
+            // ---- K-means on rest-field spots only ----
+            // ROI clusters are pre-assigned; only rest spots need clustering.
+            var spotCluster = new Dictionary<SpotInfo, int>(allSpots.Count);
+            foreach (var kv in spotClusterOverride)
+                spotCluster[kv.Key] = kv.Value; // ROI assignments
 
-            double minX = spots.Min(s => s.X);
-            double maxX = spots.Max(s => s.X);
-            double minY = spots.Min(s => s.Y);
-            double maxY = spots.Max(s => s.Y);
-
-            double colWidth  = (maxX - minX + 0.001) / cols;
-            double rowHeight = (maxY - minY + 0.001) / rows;
-
-            // Assign each spot to a cell key and build a reverse lookup
-            var spotCell = new Dictionary<SpotInfo, int>(spots.Count);
-            var cells    = new Dictionary<int, HashSet<SpotInfo>>();
-            foreach (SpotInfo spot in spots)
+            if (restSpots.Count > 0 && nRestClusters > 0)
             {
-                int c   = Math.Min((int)((spot.X - minX) / colWidth),  cols - 1);
-                int r   = Math.Min((int)((spot.Y - minY) / rowHeight), rows - 1);
-                int key = c * rows + r;
-                spotCell[spot] = key;
-                if (!cells.ContainsKey(key)) cells[key] = new HashSet<SpotInfo>();
-                cells[key].Add(spot);
+                int n = Math.Min(nRestClusters, restSpots.Count);
+                List<SpotInfo> sortedByX = restSpots.OrderBy(s => s.X).ToList();
+                double[] cx = new double[n];
+                double[] cy = new double[n];
+                for (int k = 0; k < n; k++)
+                {
+                    int idx = (int)((k + 0.5) * sortedByX.Count / n);
+                    cx[k] = sortedByX[idx].X;
+                    cy[k] = sortedByX[idx].Y;
+                }
+
+                int[] asgn = new int[restSpots.Count];
+                for (int iter = 0; iter < 20; iter++)
+                {
+                    bool changed = false;
+                    for (int i = 0; i < restSpots.Count; i++)
+                    {
+                        int best = 0; double bestD = double.MaxValue;
+                        for (int k = 0; k < n; k++)
+                        {
+                            double dx = restSpots[i].X - cx[k];
+                            double dy = restSpots[i].Y - cy[k];
+                            double d  = dx * dx + dy * dy;
+                            if (d < bestD) { bestD = d; best = k; }
+                        }
+                        if (asgn[i] != best) { asgn[i] = best; changed = true; }
+                    }
+                    if (!changed) break;
+
+                    double[] sumX = new double[n]; double[] sumY = new double[n]; int[] cnt = new int[n];
+                    for (int i = 0; i < restSpots.Count; i++)
+                    { sumX[asgn[i]] += restSpots[i].X; sumY[asgn[i]] += restSpots[i].Y; cnt[asgn[i]]++; }
+                    for (int k = 0; k < n; k++)
+                        if (cnt[k] > 0) { cx[k] = sumX[k] / cnt[k]; cy[k] = sumY[k] / cnt[k]; }
+                }
+
+                // Offset rest cluster indices by nRoiClusters
+                for (int i = 0; i < restSpots.Count; i++)
+                    spotCluster[restSpots[i]] = nRoiClusters + asgn[i];
             }
 
-            var remaining = new HashSet<SpotInfo>(spots);
-            int violations = 0;
+            // Build cluster lists and centroids
+            var clusters   = new Dictionary<int, List<SpotInfo>>();
+            var centroidX  = new Dictionary<int, double>();
+            var centroidY  = new Dictionary<int, double>();
+            foreach (SpotInfo s in allSpots)
+            {
+                int c = spotCluster.ContainsKey(s) ? spotCluster[s] : nRoiClusters;
+                if (!clusters.ContainsKey(c)) clusters[c] = new List<SpotInfo>();
+                clusters[c].Add(s);
+            }
+            foreach (var kv in clusters)
+            {
+                centroidX[kv.Key] = kv.Value.Average(s => s.X);
+                centroidY[kv.Key] = kv.Value.Average(s => s.Y);
+            }
+
+            // ---- Build visit order ----
+            // ROI clusters first (in user order: 0, 1, ..., nRoiClusters-1)
+            // Then rest clusters in greedy nearest-centroid order
+            var visitOrder = new List<int>();
+            for (int k = 0; k < nRoiClusters; k++)
+                if (clusters.ContainsKey(k)) visitOrder.Add(k);
 
             SpotInfo currentPos = activeField.SequencedSpots.Count > 0
                 ? activeField.SequencedSpots[activeField.SequencedSpots.Count - 1]
                 : null;
 
-            // Handle pinned start spot
-            if (applyStartSpot && pinnedStartSpot != null && remaining.Count > 0)
+            // Start greedy TSP for rest clusters from the centroid of the last ROI cluster
+            double curX, curY;
+            if (visitOrder.Count > 0)
             {
-                SpotInfo pinned = remaining.OrderBy(s => Dist(pinnedStartSpot, s)).First();
-                remaining.Remove(pinned);
-                activeField.SequencedSpots.Add(pinned.Copy());
-                currentPos = pinned;
+                int lastRoi = visitOrder[visitOrder.Count - 1];
+                curX = centroidX[lastRoi]; curY = centroidY[lastRoi];
+            }
+            else
+            {
+                curX = currentPos != null ? currentPos.X : 0;
+                curY = currentPos != null ? currentPos.Y : 0;
             }
 
-            // Core loop: prefer nearest spot in the SAME cell (zero intra-cell jumps).
-            // Only cross to another cell when the current cell is exhausted.
-            // The cross-cell jump is always the shortest possible (globally nearest).
-            while (remaining.Count > 0)
+            var unvisited = new HashSet<int>(clusters.Keys.Where(k => k >= nRoiClusters));
+            while (unvisited.Count > 0)
             {
-                int currentCell = (currentPos != null && spotCell.ContainsKey(currentPos))
-                    ? spotCell[currentPos] : -1;
-
-                SpotInfo next     = null;
-                double   nextDist = double.MaxValue;
-                bool     isCrossCell = false;
-
-                // 1. Nearest spot in same cell
-                if (currentCell >= 0 && cells.ContainsKey(currentCell))
+                int best = -1; double bestD = double.MaxValue;
+                foreach (int k in unvisited)
                 {
-                    foreach (SpotInfo s in cells[currentCell])
+                    double dx = centroidX[k] - curX, dy = centroidY[k] - curY;
+                    double d  = dx * dx + dy * dy;
+                    if (d < bestD) { bestD = d; best = k; }
+                }
+                visitOrder.Add(best);
+                unvisited.Remove(best);
+                curX = centroidX[best]; curY = centroidY[best];
+            }
+
+            // ---- Apply pinned start spot (first cluster only) ----
+            SpotInfo pinnedOverride = null;
+            if (pinnedStartSpot != null && visitOrder.Count > 0)
+            {
+                List<SpotInfo> firstCluster = clusters[visitOrder[0]];
+                pinnedOverride = firstCluster.OrderBy(s => Dist(pinnedStartSpot, s)).First();
+            }
+
+            // ---- Sequence cluster by cluster ----
+            var remaining = new HashSet<SpotInfo>(allSpots);
+            int violations = 0;
+
+            for (int vi = 0; vi < visitOrder.Count; vi++)
+            {
+                int clusterKey = visitOrder[vi];
+                if (!clusters.ContainsKey(clusterKey)) continue;
+
+                // Entry: nearest spot in this cluster to currentPos
+                // (or pinned spot for the very first cluster)
+                SpotInfo entry = null;
+                if (vi == 0 && pinnedOverride != null && remaining.Contains(pinnedOverride))
+                    entry = pinnedOverride;
+                else
+                {
+                    double entryDist = double.MaxValue;
+                    foreach (SpotInfo s in clusters[clusterKey])
                     {
                         if (!remaining.Contains(s)) continue;
                         double d = currentPos != null ? Dist(currentPos, s) : 0;
-                        if (d < nextDist) { nextDist = d; next = s; }
+                        if (d < entryDist) { entryDist = d; entry = s; }
                     }
                 }
+                if (entry == null) continue;
 
-                // 2. Current cell empty — find nearest spot globally
-                if (next == null)
+                // Count inter-cluster jump violation
+                if (hasLimits && currentPos != null
+                    && !IsWithinJump(currentPos, entry, maxJumpX, maxJumpY))
+                    violations++;
+
+                // Nearest-neighbour through this cluster from entry
+                var pool = clusters[clusterKey].Where(s => remaining.Contains(s)).ToList();
+                pool.Remove(entry);
+                remaining.Remove(entry);
+                activeField.SequencedSpots.Add(entry.Copy());
+                currentPos = entry;
+
+                while (pool.Count > 0)
                 {
-                    foreach (SpotInfo s in remaining)
-                    {
-                        double d = currentPos != null ? Dist(currentPos, s) : 0;
-                        if (d < nextDist) { nextDist = d; next = s; }
-                    }
-                    isCrossCell = true;
+                    SpotInfo next = null; double nd = double.MaxValue;
+                    foreach (SpotInfo s in pool)
+                    { double d = Dist(currentPos, s); if (d < nd) { nd = d; next = s; } }
+                    pool.Remove(next);
+                    remaining.Remove(next);
+                    activeField.SequencedSpots.Add(next.Copy());
+                    currentPos = next;
                 }
-
-                if (hasLimits && isCrossCell && currentPos != null && next != null)
-                {
-                    if (!IsWithinJump(currentPos, next, maxJumpX, maxJumpY))
-                        violations++;
-                }
-
-                remaining.Remove(next);
-                activeField.SequencedSpots.Add(next.Copy());
-                currentPos = next;
             }
 
             return violations;
         }
+
 
         private static double Dist(SpotInfo a, SpotInfo b)
         {
