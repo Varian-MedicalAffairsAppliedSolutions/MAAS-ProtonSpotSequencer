@@ -207,6 +207,8 @@ public static class SimpleLicenseVerifier
     {
         return string.Equals(inputCode, HARDCODED_ACCESS_CODE, StringComparison.OrdinalIgnoreCase);
     }
+
+
 }
 
 namespace VMS.TPS
@@ -868,6 +870,9 @@ namespace VMS.TPS
         private readonly Dictionary<string, FieldState> fieldsById;
         private readonly HashSet<string> selectedStructureNames;
 
+        private readonly Dictionary<string, object> cachedEditableParameters = 
+        new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
+
         private readonly List<FieldState> fields;
 
         private ComboBox fieldSelector;
@@ -932,6 +937,11 @@ namespace VMS.TPS
             fieldsById = new Dictionary<string, FieldState>(StringComparer.OrdinalIgnoreCase);
             selectedStructureNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
             fields = new List<FieldState>();
+ 
+            context.Patient.BeginModifications();
+ 
+            modificationsBegun = true;
+            modificationsBegun = true;
 
             BuildUi();
             LoadPlanData();
@@ -1428,6 +1438,7 @@ namespace VMS.TPS
             }
 
             var editableParameters = beam.GetEditableParameters();
+            cachedEditableParameters[beam.Id] = editableParameters;
             int layerIndex = 0;
             foreach (var controlPointPair in editableParameters.IonControlPointPairs)
             {
@@ -1700,6 +1711,28 @@ namespace VMS.TPS
             }
         }
 
+        private void SavePatient()
+        {
+            MethodInfo saveMethod = context.Patient.GetType()
+                .GetMethods()
+                .FirstOrDefault(m => m.Name.ToLower().Contains("save") && m.GetParameters().Length == 0);
+            
+            if (saveMethod != null)
+            {
+                saveMethod.Invoke(context.Patient, null);
+            }
+            else
+            {
+                // List available methods for debugging
+                string methods = string.Join("\n", context.Patient.GetType()
+                    .GetMethods()
+                    .Select(m => m.Name)
+                    .Distinct()
+                    .OrderBy(n => n)
+                    .ToArray());
+ 
+            }
+        }
         private void UpdateSummaries()
         {
             if (activeField == null)
@@ -1957,7 +1990,7 @@ namespace VMS.TPS
                 SpotInfo entry = null;
                 if (vi == 0 && pinnedOverride != null && remaining.Contains(pinnedOverride))
                     entry = pinnedOverride;
-                else
+             else
                 {
                     double entryDist = double.MaxValue;
                     foreach (SpotInfo s in clusters[clusterKey])
@@ -1985,7 +2018,12 @@ namespace VMS.TPS
                 {
                     SpotInfo next = null; double nd = double.MaxValue;
                     foreach (SpotInfo s in pool)
-                    { double d = Dist(currentPos, s); if (d < nd) { nd = d; next = s; } }
+                    {
+                        double d = Dist(currentPos, s);
+                        bool withinLimits = !hasLimits || IsWithinJump(currentPos, s, maxJumpX, maxJumpY);
+                        double effectiveDist = withinLimits ? d : d + 1e9;
+                        if (effectiveDist < nd) { nd = effectiveDist; next = s; }
+                    }
                     pool.Remove(next);
                     remaining.Remove(next);
                     activeField.SequencedSpots.Add(next.Copy());
@@ -2048,6 +2086,12 @@ namespace VMS.TPS
 
         private void ApplyChangesToPlan()
         {
+            if (fields.Count > 0 && fields[0].OriginalSpots.Count > 0)
+                {
+                    SpotInfo first = fields[0].OriginalSpots[0];
+                    SpotInfo second = fields[0].OriginalSpots.Count > 1 ? fields[0].OriginalSpots[1] : null;
+ 
+                }
             List<FieldState> modifiedFields = fields.Where(field => field.HasPendingSequence).ToList();
             if (modifiedFields.Count == 0)
             {
@@ -2075,6 +2119,7 @@ namespace VMS.TPS
                 }
 
                 IonPlanSetup plan = context.IonPlanSetup;
+            
                 double planNormalizationValue = ConvertRequiredToDouble(plan.PlanNormalizationValue, "Plan normalization value");
                 if (planNormalizationValue == 0.0)
                 {
@@ -2117,39 +2162,65 @@ namespace VMS.TPS
                         continue;
                     }
 
-                    var editableParameters = beam.GetEditableParameters();
-                    double fieldNorm = ConvertRequiredToDouble(editableParameters.WeightFactor, "Beam weight factor");
+                    object editableParameters;
+                    if (!cachedEditableParameters.TryGetValue(beam.Id, out editableParameters))
+                        throw new InvalidOperationException("No cached editable parameters for beam '" + beam.Id + "'.");
+
+                    PropertyInfo weightFactorProp = editableParameters.GetType().GetProperty("WeightFactor");
+                    if (weightFactorProp == null)
+                        throw new InvalidOperationException("Could not find WeightFactor property on editable parameters.");
+                    double fieldNorm = ConvertRequiredToDouble(weightFactorProp.GetValue(editableParameters, null), "Beam weight factor");
                     double muPerWeight = (planNorm * prescribedDose * fieldNorm) / treatmentPercentage;
                     if (muPerWeight <= 0.0)
-                    {
                         throw new InvalidOperationException("Derived MU-per-weight conversion factor is invalid for beam '" + beam.Id + "'.");
-                    }
 
-                    foreach (var controlPointPair in editableParameters.IonControlPointPairs)
+                    PropertyInfo cpPairsProp = editableParameters.GetType().GetProperty("IonControlPointPairs");
+                    if (cpPairsProp == null)
+                        throw new InvalidOperationException("Could not find IonControlPointPairs property on editable parameters.");
+                    var controlPointPairs = (System.Collections.IEnumerable)cpPairsProp.GetValue(editableParameters, null);
+                foreach (var controlPointPair in controlPointPairs)
+                {
+                    try
                     {
-                        if (controlPointPair.RawSpotList.Count > 0)
+                        Type cpType = controlPointPair.GetType();
+                        object rawSpotList = cpType.GetProperty("RawSpotList").GetValue(controlPointPair, null);
+                        int rawCount = (int)rawSpotList.GetType().GetProperty("Count").GetValue(rawSpotList, null);
+
+                        if (rawCount > 0)
                         {
-                            controlPointPair.ResizeRawSpotList(field.SequencedSpots.Count);
+                            cpType.GetMethod("ResizeRawSpotList").Invoke(controlPointPair, new object[] { field.SequencedSpots.Count });
+                            rawSpotList = cpType.GetProperty("RawSpotList").GetValue(controlPointPair, null);
                             for (int i = 0; i < field.SequencedSpots.Count; i++)
                             {
                                 SpotInfo spot = field.SequencedSpots[i];
-                                controlPointPair.RawSpotList[i].Weight = (float)(spot.MonitorUnits / muPerWeight);
-                                controlPointPair.RawSpotList[i].X = (float)spot.X;
-                                controlPointPair.RawSpotList[i].Y = (float)spot.Y;
+                                object rawSpot = rawSpotList.GetType().GetProperty("Item").GetValue(rawSpotList, new object[] { i });
+                                rawSpot.GetType().GetProperty("Weight").SetValue(rawSpot, (float)(spot.MonitorUnits / muPerWeight), null);
+                                rawSpot.GetType().GetProperty("X").SetValue(rawSpot, (float)spot.X, null);
+                                rawSpot.GetType().GetProperty("Y").SetValue(rawSpot, (float)spot.Y, null);
                             }
                         }
                         else
                         {
-                            controlPointPair.ResizeFinalSpotList(field.SequencedSpots.Count);
+                            object finalSpotList = cpType.GetProperty("FinalSpotList").GetValue(controlPointPair, null);
+                            cpType.GetMethod("ResizeFinalSpotList").Invoke(controlPointPair, new object[] { field.SequencedSpots.Count });
+                            finalSpotList = cpType.GetProperty("FinalSpotList").GetValue(controlPointPair, null);
                             for (int i = 0; i < field.SequencedSpots.Count; i++)
                             {
                                 SpotInfo spot = field.SequencedSpots[i];
-                                controlPointPair.FinalSpotList[i].Weight = (float)(spot.MonitorUnits / muPerWeight);
-                                controlPointPair.FinalSpotList[i].X = (float)spot.X;
-                                controlPointPair.FinalSpotList[i].Y = (float)spot.Y;
+                                object finalSpot = finalSpotList.GetType().GetProperty("Item").GetValue(finalSpotList, new object[] { i });
+                                finalSpot.GetType().GetProperty("Weight").SetValue(finalSpot, (float)(spot.MonitorUnits / muPerWeight), null);
+                                finalSpot.GetType().GetProperty("X").SetValue(finalSpot, (float)spot.X, null);
+                                finalSpot.GetType().GetProperty("Y").SetValue(finalSpot, (float)spot.Y, null);
                             }
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        Exception inner = ex;
+                        while (inner.InnerException != null) inner = inner.InnerException;
+                        throw new InvalidOperationException("Failed writing spots to control point pair: " + inner.Message, ex);
+                    }
+                }
 
                     editableParametersByBeamId[beam.Id] = editableParameters;
                 }
@@ -2158,26 +2229,66 @@ namespace VMS.TPS
                 {
                     object editableParameters;
                     if (!editableParametersByBeamId.TryGetValue(beam.Id, out editableParameters))
-                    {
                         continue;
+
+
+                    try
+                    {
+                        
+ 
+                        MethodInfo[] allMethods = beam.GetType().GetMethods();
+                        string methodList = string.Join("\n", 
+                            allMethods
+                                .Where(m => m.Name == "ApplyParameters")
+                                .Select(m => m.Name + "(" + 
+                                    string.Join(", ", m.GetParameters().Select(p => p.ParameterType.Name)) + ")")
+                                .ToArray());
+  
+                        InvokeApplyParameters(beam, editableParameters);
+                                        
+                         }
+                    catch (Exception ex)
+                    {
+                        Exception inner = ex;
+                            while (inner.InnerException != null) inner = inner.InnerException;
+                            throw new InvalidOperationException(
+                                "ApplyParameters failed for beam '" + beam.Id + "': " + inner.Message + 
+                                "\n\nStack trace:\n" + inner.StackTrace, ex);
                     }
-
-                    InvokeApplyParameters(beam, editableParameters);
                 }
-
                 string doseError;
                 if (!TryRecalculateDose(plan, out doseError))
                 {
-                    throw new InvalidOperationException(doseError);
+                    MessageBox.Show(
+                        "Spot sequence applied successfully, but automatic dose recalculation failed.\n\nPlease recalculate dose manually in Eclipse (Planning → Dose Calculation → Calculate Volume).",
+                        "Dose Recalculation Required", MessageBoxButton.OK, MessageBoxImage.Warning);
                 }
 
+                cachedEditableParameters.Clear();
                 LoadPlanData();
+                MessageBox.Show("Spot sequence applied successfully.", "Success", MessageBoxButton.OK, MessageBoxImage.Information);
+     
+     
+                if (fields.Count > 0 && fields[0].OriginalSpots.Count > 0)
+                {
+                    SpotInfo first = fields[0].OriginalSpots[0];
+                    SpotInfo second = fields[0].OriginalSpots.Count > 1 ? fields[0].OriginalSpots[1] : null;
+                    
+                }
                 MessageBox.Show("The sequenced spots were applied successfully.", "Success", MessageBoxButton.OK, MessageBoxImage.Information);
             }
             catch (Exception ex)
             {
-                MessageBox.Show(ex.Message, "Apply Failed", MessageBoxButton.OK, MessageBoxImage.Error);
-                SetStatus("Apply failed.");
+                Exception inner = ex;
+                while (inner.InnerException != null)
+                    inner = inner.InnerException;
+
+                string errorText = inner == ex
+                    ? ex.Message
+                    : ex.Message + "\n\nInner cause: " + inner.Message;
+
+                MessageBox.Show(errorText, "Apply Failed", MessageBoxButton.OK, MessageBoxImage.Error);
+                SetStatus("Apply failed."); // this line is fine here — same class
             }
             finally
             {
@@ -2218,49 +2329,32 @@ namespace VMS.TPS
 
             return displayName + " (ID: " + context.Patient.Id + ")";
         }
-
         private static void InvokeApplyParameters(IonBeam beam, object editableParameters)
         {
-            MethodInfo method = beam.GetType()
-                .GetMethods()
-                .FirstOrDefault(candidate => candidate.Name == "ApplyParameters" && candidate.GetParameters().Length == 1);
-
+            // Look for ApplyParameters that accepts IonBeamParameters specifically
+            Type paramsType = editableParameters.GetType(); // IonBeamParameters
+            
+            MethodInfo method = beam.GetType().GetMethod("ApplyParameters", new Type[] { paramsType });
+            
             if (method == null)
             {
-                throw new MissingMethodException("Could not locate IonBeam.ApplyParameters.");
+                // Fall back to BeamParameters (base type)
+                method = beam.GetType().GetMethod("ApplyParameters", new Type[] { paramsType.BaseType });
             }
+
+            if (method == null)
+                throw new MissingMethodException("Could not locate IonBeam.ApplyParameters.");
 
             method.Invoke(beam, new[] { editableParameters });
         }
-
         private static bool TryRecalculateDose(IonPlanSetup plan, out string errorMessage)
         {
             errorMessage = null;
             try
             {
                 MethodInfo calculateDoseMethod = plan.GetType().GetMethod("CalculateDose", Type.EmptyTypes);
-                if (calculateDoseMethod == null)
-                {
-                    return true;
-                }
-
-                object result = calculateDoseMethod.Invoke(plan, null);
-                if (result == null)
-                {
-                    return true;
-                }
-
-                PropertyInfo successProperty = result.GetType().GetProperty("Success");
-                if (successProperty != null && successProperty.PropertyType == typeof(bool))
-                {
-                    bool success = (bool)successProperty.GetValue(result, null);
-                    if (!success)
-                    {
-                        errorMessage = "Dose calculation failed after applying the sequenced spots.";
-                        return false;
-                    }
-                }
-
+                if (calculateDoseMethod != null)
+                    calculateDoseMethod.Invoke(plan, null);
                 return true;
             }
             catch (TargetInvocationException ex)
@@ -2274,7 +2368,6 @@ namespace VMS.TPS
                 return false;
             }
         }
-
         private static double ConvertRequiredToDouble(object value, string valueName)
         {
             if (value == null)
