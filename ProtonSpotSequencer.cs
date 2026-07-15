@@ -356,6 +356,8 @@ namespace VMS.TPS
 
         public double ViewYMax { get; set; }
 
+        public double MuPerWeight { get; set; }
+
         public bool HasPendingSequence
         {
             get { return SequencedSpots.Count > 0; }
@@ -1437,6 +1439,8 @@ namespace VMS.TPS
                 muPerWeight = beamMetersetValue / totalMetersetWeight;
             }
 
+            field.MuPerWeight = muPerWeight;
+
             var editableParameters = beam.GetEditableParameters();
             cachedEditableParameters[beam.Id] = editableParameters;
             int layerIndex = 0;
@@ -2119,39 +2123,6 @@ namespace VMS.TPS
                 }
 
                 IonPlanSetup plan = context.IonPlanSetup;
-            
-                double planNormalizationValue = ConvertRequiredToDouble(plan.PlanNormalizationValue, "Plan normalization value");
-                if (planNormalizationValue == 0.0)
-                {
-                    throw new InvalidOperationException("Plan normalization value is zero. Cannot convert monitor units back to spot weights.");
-                }
-
-                double treatmentPercentage = ConvertRequiredToDouble(plan.TreatmentPercentage, "Treatment percentage");
-                if (treatmentPercentage == 0.0)
-                {
-                    throw new InvalidOperationException("Treatment percentage is zero. Cannot convert monitor units back to spot weights.");
-                }
-
-                double numberOfFractions = ConvertRequiredToDouble(plan.NumberOfFractions, "Number of fractions");
-                if (numberOfFractions == 0.0)
-                {
-                    throw new InvalidOperationException("Number of fractions is zero. Cannot convert monitor units back to spot weights.");
-                }
-
-                DoseValue? dosePerFraction = plan.DosePerFraction;
-                if (!dosePerFraction.HasValue)
-                {
-                    throw new InvalidOperationException("Dose per fraction is not defined. Cannot convert monitor units back to spot weights.");
-                }
-
-                double? dosePerFractionDose = dosePerFraction.Value.Dose;
-                if (!dosePerFractionDose.HasValue)
-                {
-                    throw new InvalidOperationException("Dose per fraction value is not defined. Cannot convert monitor units back to spot weights.");
-                }
-
-                double prescribedDose = dosePerFractionDose.Value * numberOfFractions;
-                double planNorm = 100.0 / planNormalizationValue;
 
                 Dictionary<string, object> editableParametersByBeamId = new Dictionary<string, object>(StringComparer.OrdinalIgnoreCase);
                 foreach (IonBeam beam in plan.IonBeams)
@@ -2162,65 +2133,38 @@ namespace VMS.TPS
                         continue;
                     }
 
-                    object editableParameters;
-                    if (!cachedEditableParameters.TryGetValue(beam.Id, out editableParameters))
-                        throw new InvalidOperationException("No cached editable parameters for beam '" + beam.Id + "'.");
-
-                    PropertyInfo weightFactorProp = editableParameters.GetType().GetProperty("WeightFactor");
-                    if (weightFactorProp == null)
-                        throw new InvalidOperationException("Could not find WeightFactor property on editable parameters.");
-                    double fieldNorm = ConvertRequiredToDouble(weightFactorProp.GetValue(editableParameters, null), "Beam weight factor");
-                    double muPerWeight = (planNorm * prescribedDose * fieldNorm) / treatmentPercentage;
+                    var editableParameters = beam.GetEditableParameters();
+                    double muPerWeight = field.MuPerWeight;
                     if (muPerWeight <= 0.0)
-                        throw new InvalidOperationException("Derived MU-per-weight conversion factor is invalid for beam '" + beam.Id + "'.");
-
-                    PropertyInfo cpPairsProp = editableParameters.GetType().GetProperty("IonControlPointPairs");
-                    if (cpPairsProp == null)
-                        throw new InvalidOperationException("Could not find IonControlPointPairs property on editable parameters.");
-                    var controlPointPairs = (System.Collections.IEnumerable)cpPairsProp.GetValue(editableParameters, null);
-                foreach (var controlPointPair in controlPointPairs)
-                {
-                    try
                     {
-                        Type cpType = controlPointPair.GetType();
-                        object rawSpotList = cpType.GetProperty("RawSpotList").GetValue(controlPointPair, null);
-                        int rawCount = (int)rawSpotList.GetType().GetProperty("Count").GetValue(rawSpotList, null);
+                        throw new InvalidOperationException("Invalid MU-per-weight for beam '" + beam.Id + "'.");
+                    }
 
-                        if (rawCount > 0)
+                    foreach (var controlPointPair in editableParameters.IonControlPointPairs)
+                    {
+                        if (controlPointPair.RawSpotList.Count > 0)
                         {
-                            cpType.GetMethod("ResizeRawSpotList").Invoke(controlPointPair, new object[] { field.SequencedSpots.Count });
-                            rawSpotList = cpType.GetProperty("RawSpotList").GetValue(controlPointPair, null);
+                            controlPointPair.ResizeRawSpotList(field.SequencedSpots.Count);
                             for (int i = 0; i < field.SequencedSpots.Count; i++)
                             {
                                 SpotInfo spot = field.SequencedSpots[i];
-                                object rawSpot = rawSpotList.GetType().GetProperty("Item").GetValue(rawSpotList, new object[] { i });
-                                rawSpot.GetType().GetProperty("Weight").SetValue(rawSpot, (float)(spot.MonitorUnits / muPerWeight), null);
-                                rawSpot.GetType().GetProperty("X").SetValue(rawSpot, (float)spot.X, null);
-                                rawSpot.GetType().GetProperty("Y").SetValue(rawSpot, (float)spot.Y, null);
+                                controlPointPair.RawSpotList[i].Weight = (float)(spot.MonitorUnits / muPerWeight);
+                                controlPointPair.RawSpotList[i].X = (float)spot.X;
+                                controlPointPair.RawSpotList[i].Y = (float)spot.Y;
                             }
                         }
                         else
                         {
-                            object finalSpotList = cpType.GetProperty("FinalSpotList").GetValue(controlPointPair, null);
-                            cpType.GetMethod("ResizeFinalSpotList").Invoke(controlPointPair, new object[] { field.SequencedSpots.Count });
-                            finalSpotList = cpType.GetProperty("FinalSpotList").GetValue(controlPointPair, null);
+                            controlPointPair.ResizeFinalSpotList(field.SequencedSpots.Count);
                             for (int i = 0; i < field.SequencedSpots.Count; i++)
                             {
                                 SpotInfo spot = field.SequencedSpots[i];
-                                object finalSpot = finalSpotList.GetType().GetProperty("Item").GetValue(finalSpotList, new object[] { i });
-                                finalSpot.GetType().GetProperty("Weight").SetValue(finalSpot, (float)(spot.MonitorUnits / muPerWeight), null);
-                                finalSpot.GetType().GetProperty("X").SetValue(finalSpot, (float)spot.X, null);
-                                finalSpot.GetType().GetProperty("Y").SetValue(finalSpot, (float)spot.Y, null);
+                                controlPointPair.FinalSpotList[i].Weight = (float)(spot.MonitorUnits / muPerWeight);
+                                controlPointPair.FinalSpotList[i].X = (float)spot.X;
+                                controlPointPair.FinalSpotList[i].Y = (float)spot.Y;
                             }
                         }
                     }
-                    catch (Exception ex)
-                    {
-                        Exception inner = ex;
-                        while (inner.InnerException != null) inner = inner.InnerException;
-                        throw new InvalidOperationException("Failed writing spots to control point pair: " + inner.Message, ex);
-                    }
-                }
 
                     editableParametersByBeamId[beam.Id] = editableParameters;
                 }
@@ -2350,12 +2294,11 @@ namespace VMS.TPS
         private static bool TryRecalculateDose(IonPlanSetup plan, out string errorMessage)
         {
             errorMessage = null;
-            try
-            {
-                MethodInfo calculateDoseMethod = plan.GetType().GetMethod("CalculateDose", Type.EmptyTypes);
-                if (calculateDoseMethod != null)
-                    calculateDoseMethod.Invoke(plan, null);
-                return true;
+            try            
+                {                    
+                    
+                plan.CalculateDoseWithoutPostProcessing();
+                return true;  
             }
             catch (TargetInvocationException ex)
             {
