@@ -7,6 +7,6 @@ Original work by Michiko Rossi, Matti Ropo, Pierre Lansonneur and Viljo Petäjä
 ----
 
 Improvements, to-do:
-*  Spots excluded from reordering are dleted from field without warning the user
+*  Spots excluded from reordering are deleted from field without warning the user
 *  Click drag support for less clicking
 *  Likely more needed..
