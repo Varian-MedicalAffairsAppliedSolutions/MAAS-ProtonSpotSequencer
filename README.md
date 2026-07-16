@@ -3,7 +3,7 @@
 Used LLM to convert Helsinki team PyESAPI "Pattern Editor" tool into a single file .cs plugin
 <br>
 Original work by Michiko Rossi, Matti Ropo, Pierre Lansonneur and Viljo Petäjä
----
+***
 Improvements, to-do:
 *  Spots excluded from reordering are dleted from field without warning the user
 *  Click drag support for less clicking
